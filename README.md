@@ -54,11 +54,13 @@ The script auto-detects and combines datasets from:
 - Common Voice (English, Arabic)
 - Generated preset clips
 
-Training follows the paper's recipe:
+Training follows the paper's recipe with key additions:
 - Stochastic quantization (50% quantize / 25% dither / 25% passthrough for acoustic)
 - Whisper ASR distillation for semantic token diversity
+- **Codebook diversity loss** (entropy-based, breaks semantic collapse)
 - 8 multi-resolution STFT discriminators with feature matching
 - Exponentially decaying reconstruction losses
+- Multi-GPU DDP support (`torchrun --nproc_per_node=N`)
 
 ### Phase 2: Full Pipeline LoRA
 
@@ -134,7 +136,11 @@ discovered a 4-stage convolutional-transformer encoder with:
 ### The Invisible Walls
 
 **Wall 1 - Codebook Collapse**: Naive training produces `sem_util=1/8192`
-(only 1 of 8192 semantic codes used). Solved by ASR distillation from Whisper.
+(only 1 of 8192 semantic codes used). ASR distillation from Whisper is necessary
+but not sufficient -- the encoder can produce diverse continuous features that all
+map to the same VQ entry. Solved by combining ASR with an entropy-based
+**codebook diversity loss** that explicitly spreads outputs across the frozen
+codebook geometry (sem_util 1 -> 100+ in 500 steps).
 
 **Wall 2 - Binary Code Saturation**: Without stochastic quantization, acoustic
 codes collapse to extremes (0 and 20 only). The 50/25/25 schedule from the

@@ -6,11 +6,13 @@ Implements the codec encoder architecture described in the Voxtral TTS paper
 included in the open-weight release; this script trains it from scratch using
 the frozen decoder and quantizer weights from the checkpoint.
 
-Training follows the paper's recipe:
+Training follows the paper's recipe with key additions:
   - Stochastic VQ (50% quantize / 25% dither / 25% passthrough)
   - ASR distillation from Whisper for semantic token diversity
+  - Codebook diversity loss (entropy-based) to break semantic collapse
   - Multi-resolution STFT discriminator with feature matching loss
   - Exponentially decaying reconstruction loss
+  - Multi-GPU DDP support (torchrun)
 
 After training, encoder weights can be injected into the model checkpoint
 to enable ref_audio voice cloning.
@@ -24,22 +26,38 @@ import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 import numpy as np
 import soundfile as sf
 from pathlib import Path
 from copy import deepcopy
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 USE_ASR_DISTILL = os.environ.get("USE_ASR_DISTILL", "1") == "1"
-MODEL_DIR = os.environ.get("MODEL_DIR", "/models/Voxtral-4B-TTS-2603")
-DATA_DIR = os.environ.get("DATA_DIR", "/codec_data")
-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/encoder_trained")
-BATCH_SIZE = 4
-MAX_AUDIO_SEC = 4
+MODEL_DIR = os.environ.get("MODEL_DIR", "/workspace/Voxtral-4B-TTS-2603")
+DATA_DIR = os.environ.get("DATA_DIR", "/workspace/data")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/workspace/encoder_trained")
+BATCH_SIZE_PER_GPU = int(os.environ.get("BATCH_SIZE_PER_GPU", "8"))
+MAX_AUDIO_SEC = int(os.environ.get("MAX_AUDIO_SEC", "8"))
 LR = 3e-4
 EPOCHS = 30
 SAMPLE_RATE = 24000
 LOG_EVERY = 25
+
+def setup_distributed():
+    if "RANK" in os.environ:
+        dist.init_process_group("nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        return local_rank, rank, world_size
+    return 0, 0, 1
+
+LOCAL_RANK, RANK, WORLD_SIZE = setup_distributed()
+DEVICE = f"cuda:{LOCAL_RANK}"
+IS_MAIN = RANK == 0
 
 # ============================================================
 # Codec architecture (matching the open-weight model spec)
@@ -751,7 +769,7 @@ class AudioDataset(torch.utils.data.Dataset):
         self.files = sorted(self.files)
         if max_samples:
             self.files = self.files[:max_samples]
-        print(f"Dataset: {len(self.files)} files from {data_dir}")
+        if IS_MAIN: print(f"Dataset: {len(self.files)} files from {data_dir}")
 
     def __len__(self):
         return len(self.files)
@@ -767,7 +785,42 @@ class AudioDataset(torch.utils.data.Dataset):
         if len(audio) > max_len:
             start = np.random.randint(0, len(audio) - max_len)
             audio = audio[start:start + max_len]
-        # Pad to multiple of patch_size (240)
+        if len(audio) % 240 != 0:
+            audio = np.pad(audio, (0, 240 - len(audio) % 240))
+        return torch.from_numpy(audio).float()
+
+
+class HFAudioDataset(torch.utils.data.Dataset):
+    """Reads audio from a HuggingFace dataset, bypassing torchcodec by reading raw bytes."""
+    def __init__(self, hf_dataset, max_samples=None):
+        self.ds = hf_dataset.cast_column("audio", hf_dataset.features["audio"])
+        if max_samples and max_samples < len(self.ds):
+            self.ds = self.ds.select(range(max_samples))
+        self.ds = self.ds.with_format("arrow")
+        if IS_MAIN: print(f"HF Dataset: {len(self.ds)} clips")
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, idx):
+        import io
+        row = self.ds[idx]
+        audio_col = row.column("audio")[0].as_py()
+        audio_bytes = audio_col["bytes"]
+        if audio_bytes:
+            audio, sr = sf.read(io.BytesIO(audio_bytes), dtype='float32')
+        else:
+            path = audio_col.get("path", "")
+            audio, sr = sf.read(path, dtype='float32')
+        if len(audio.shape) > 1:
+            audio = audio[:, 0]
+        if sr != SAMPLE_RATE:
+            import librosa
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE)
+        max_len = MAX_AUDIO_SEC * SAMPLE_RATE
+        if len(audio) > max_len:
+            start = np.random.randint(0, len(audio) - max_len)
+            audio = audio[start:start + max_len]
         if len(audio) % 240 != 0:
             audio = np.pad(audio, (0, 240 - len(audio) % 240))
         return torch.from_numpy(audio).float()
@@ -939,18 +992,19 @@ def discriminator_loss(disc_real_outputs, disc_fake_outputs):
 def train():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    print("=" * 60)
-    print("VOXTRAL CODEC ENCODER TRAINING (paper-aligned)")
-    print("=" * 60)
+    if IS_MAIN:
+        print("=" * 60)
+        print(f"VOXTRAL CODEC ENCODER TRAINING (paper-aligned, {WORLD_SIZE} GPUs)")
+        print("=" * 60)
 
     # Build model
-    print("\nBuilding model...")
+    if IS_MAIN: print("\nBuilding model...")
     model = VoxtralCodec()
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total params: {total_params:,}")
+    if IS_MAIN: print(f"Total params: {total_params:,}")
 
     # Load frozen decoder + quantizer
-    print(f"\nLoading decoder/quantizer from {MODEL_DIR}...")
+    if IS_MAIN: print(f"\nLoading decoder/quantizer from {MODEL_DIR}...")
     model = load_decoder_weights(model, MODEL_DIR)
     model = model.to(DEVICE)
 
@@ -963,7 +1017,7 @@ def train():
         else:
             param.requires_grad = False
 
-    print(f"\nTrainable (encoder): {sum(p.numel() for p in encoder_params):,} params")
+    if IS_MAIN: print(f"\nTrainable (encoder): {sum(p.numel() for p in encoder_params):,} params")
 
     # bf16 model, float32 encoder for stable training
     model = model.bfloat16()
@@ -972,57 +1026,64 @@ def train():
         block.float()
 
     # Sanity check
-    print("\nSanity check: decoder forward pass...")
-    with torch.no_grad():
-        dummy_codes = torch.zeros(1, 37, 10, dtype=torch.long, device=DEVICE)
-        dummy_audio = model.forward_decoder(model.quantizer.decode(dummy_codes, dtype=torch.bfloat16))
-        print(f"  OK: {dummy_audio.shape}")
+    if IS_MAIN:
+        print("\nSanity check: decoder forward pass...")
+        with torch.no_grad():
+            dummy_codes = torch.zeros(1, 37, 10, dtype=torch.long, device=DEVICE)
+            dummy_audio = model.forward_decoder(model.quantizer.decode(dummy_codes, dtype=torch.bfloat16))
+            print(f"  OK: {dummy_audio.shape}")
 
     # Dataset: combine ALL available audio sources
-    print(f"\nLoading datasets...")
+    if IS_MAIN: print(f"\nLoading datasets...")
     datasets_list = []
+    HF_CACHE = os.environ.get("HF_CACHE", "/workspace/data")
 
-    # Primary: LibriSpeech clean-360 (30K clips)
+    # HuggingFace datasets (LibriSpeech)
+    try:
+        from datasets import load_dataset as hf_load
+        if IS_MAIN: print("  Loading LibriSpeech clean-360 from HuggingFace cache...")
+        hf_clean = hf_load('openslr/librispeech_asr', 'clean', split='train.360', cache_dir=HF_CACHE)
+        datasets_list.append(HFAudioDataset(hf_clean))
+        if IS_MAIN: print(f"  LibriSpeech clean-360: {len(hf_clean)} clips")
+
+        try:
+            if IS_MAIN: print("  Loading LibriSpeech other-500...")
+            hf_other = hf_load('openslr/librispeech_asr', 'other', split='train.500', cache_dir=HF_CACHE)
+            datasets_list.append(HFAudioDataset(hf_other))
+            if IS_MAIN: print(f"  LibriSpeech other-500: {len(hf_other)} clips")
+        except Exception as e:
+            if IS_MAIN: print(f"  LibriSpeech other-500: not available ({e})")
+    except Exception as e:
+        if IS_MAIN: print(f"  HuggingFace datasets not available: {e}")
+
+    # Fallback: WAV/FLAC files from directory
     if os.path.isdir(DATA_DIR):
-        ds = AudioDataset(DATA_DIR)
-        datasets_list.append(ds)
-        print(f"  LibriSpeech clean: {len(ds)} files")
-
-    # Extended: LibriSpeech other-500 (if downloaded)
-    libri500_dir = os.environ.get("LIBRI500_DIR", "/librispeech_500")
-    if os.path.isdir(libri500_dir) and len(os.listdir(libri500_dir)) > 100:
-        ds500 = AudioDataset(libri500_dir, max_samples=None)
-        datasets_list.append(ds500)
-        print(f"  LibriSpeech other-500: {len(ds500)} files")
-
-    # Common Voice Arabic (if downloaded)
-    cv_arabic_dir = os.environ.get("CV_ARABIC_DIR", "/cv_arabic")
-    if os.path.isdir(cv_arabic_dir) and len(os.listdir(cv_arabic_dir)) > 100:
-        ds_ar = AudioDataset(cv_arabic_dir, max_samples=None)
-        datasets_list.append(ds_ar)
-        print(f"  Common Voice Arabic: {len(ds_ar)} files")
-
-    # Common Voice English (if downloaded)
-    cv_english_dir = os.environ.get("CV_ENGLISH_DIR", "/cv_english")
-    if os.path.isdir(cv_english_dir) and len(os.listdir(cv_english_dir)) > 100:
-        ds_en = AudioDataset(cv_english_dir, max_samples=None)
-        datasets_list.append(ds_en)
-        print(f"  Common Voice English: {len(ds_en)} files")
+        wav_files = glob.glob(os.path.join(DATA_DIR, '**', '*.wav'), recursive=True)
+        flac_files = glob.glob(os.path.join(DATA_DIR, '**', '*.flac'), recursive=True)
+        if len(wav_files) + len(flac_files) > 10:
+            ds = AudioDataset(DATA_DIR)
+            datasets_list.append(ds)
+            if IS_MAIN: print(f"  Local audio dir: {len(ds)} files")
 
     # Preset clips (5K+ clips with known voices)
-    preset_dir = os.environ.get("PRESET_DIR", "/codec_data")
+    preset_dir = os.environ.get("PRESET_DIR", "/workspace/preset_clips")
     if os.path.isdir(preset_dir):
-        preset_ds = AudioDataset(preset_dir, max_samples=None)
-        datasets_list.append(preset_ds)
-        print(f"  Preset clips: {len(preset_ds)} files")
+        wav_count = len(glob.glob(os.path.join(preset_dir, '**', '*.wav'), recursive=True))
+        if wav_count > 10:
+            preset_ds = AudioDataset(preset_dir, max_samples=None)
+            datasets_list.append(preset_ds)
+            if IS_MAIN: print(f"  Preset clips: {len(preset_ds)} files")
 
     dataset = torch.utils.data.ConcatDataset(datasets_list) if len(datasets_list) > 1 else datasets_list[0]
-    print(f"  Total: {len(dataset)} files")
+    if IS_MAIN: print(f"  Total: {len(dataset)} files")
+
+    sampler = DistributedSampler(dataset, num_replicas=WORLD_SIZE, rank=RANK, shuffle=True) if WORLD_SIZE > 1 else None
     loader = torch.utils.data.DataLoader(
-        dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2,
-        collate_fn=collate_fn, drop_last=True, pin_memory=True
+        dataset, batch_size=BATCH_SIZE_PER_GPU, shuffle=(sampler is None),
+        num_workers=4, collate_fn=collate_fn, drop_last=True,
+        pin_memory=True, sampler=sampler
     )
-    print(f"Batches per epoch: {len(loader)}")
+    if IS_MAIN: print(f"Batches per epoch per GPU: {len(loader)} (effective batch: {BATCH_SIZE_PER_GPU * WORLD_SIZE})")
 
     # ASR Distillation (Whisper-based semantic token learning)
     asr_loss_fn = NoOpASRLoss().to(DEVICE)
@@ -1032,15 +1093,21 @@ def train():
             asr_loss_fn = ASRDistillationLoss(whisper_model="openai/whisper-base",
                                               semantic_dim=256, codec_sr=SAMPLE_RATE).to(DEVICE)
             asr_params = list(asr_loss_fn.projection.parameters())
-            print(f"ASR distillation: enabled ({sum(p.numel() for p in asr_params):,} projection params)")
+            if IS_MAIN: print(f"ASR distillation: enabled ({sum(p.numel() for p in asr_params):,} projection params)")
         except Exception as e:
-            print(f"ASR distillation: disabled ({e})")
+            if IS_MAIN: print(f"ASR distillation: disabled ({e})")
 
     # Discriminator (paper: 8 multi-resolution STFT discriminators)
     disc = MultiResolutionDiscriminator(channels=256, n_layers=4).to(DEVICE).float()
     disc_params = sum(p.numel() for p in disc.parameters())
-    print(f"Discriminator: {disc_params:,} params")
+    if IS_MAIN: print(f"Discriminator: {disc_params:,} params")
     DISC_START_STEP = 2000  # warm-up: no adversarial loss for first N steps
+
+    # Wrap encoder model in DDP (disc stays local -- it has its own optimizer
+    # and doesn't need gradient sync since each GPU trains its own copy)
+    if WORLD_SIZE > 1:
+        model = DDP(model, device_ids=[LOCAL_RANK], find_unused_parameters=True)
+    raw_model = model.module if WORLD_SIZE > 1 else model
 
     # Optimizers (separate for generator and discriminator, matching paper)
     all_trainable = encoder_params + asr_params
@@ -1053,6 +1120,8 @@ def train():
     global_step = 0
     best_loss = float('inf')
     for epoch in range(1, EPOCHS + 1):
+        if sampler is not None:
+            sampler.set_epoch(epoch)
         model.train()
         for name, mod in model.named_modules():
             if name.startswith("decoder_blocks") or name.startswith("output_proj") or name.startswith("quantizer"):
@@ -1083,39 +1152,62 @@ def train():
             feat_loss = torch.tensor(0.0, device=DEVICE)
             if global_step >= DISC_START_STEP:
                 torch.cuda.empty_cache()
+                recon_disc = recon_f[..., :min_len].detach().requires_grad_(True)
+                audio_disc = audio_f[..., :min_len].detach()
                 disc.eval()
                 with torch.no_grad():
-                    disc_real = disc(audio_f[..., :min_len])
-                disc_fake = disc(recon_f[..., :min_len])
-                fmaps_real = [fmaps for _, fmaps in disc_real]
+                    disc_real = disc(audio_disc)
+                    fmaps_real = [fmaps for _, fmaps in disc_real]
+                disc_fake = disc(recon_disc)
                 fmaps_fake = [fmaps for _, fmaps in disc_fake]
                 feat_loss = feature_matching_loss(fmaps_real, fmaps_fake)
+                del disc_real, disc_fake, fmaps_real, fmaps_fake, recon_disc, audio_disc
+                torch.cuda.empty_cache()
 
             # VQ commitment loss (delta=0.1 from paper)
             commit_loss = torch.tensor(0.0, device=DEVICE)
             if codes is not None:
                 with torch.no_grad():
-                    quantized_hard = model.quantizer.decode(
-                        model.quantizer.encode(latent.float()), dtype=torch.float32)
+                    quantized_hard = raw_model.quantizer.decode(
+                        raw_model.quantizer.encode(latent.float()), dtype=torch.float32)
                 commit_loss = F.mse_loss(latent.float(), quantized_hard.detach())
 
-            # ASR distillation (every 3rd batch to save compute)
+            # ASR distillation (every batch -- strong signal needed to break sem collapse)
             asr_loss = torch.tensor(0.0, device=DEVICE)
-            if (batch_idx % 3 == 0):
-                sem_latent = latent.float()[:, :256, :]
-                asr_loss = asr_loss_fn(audio, sem_latent)
+            sem_latent = latent.float()[:, :256, :]
+            asr_loss = asr_loss_fn(audio, sem_latent)
+
+            # Codebook diversity loss: pull encoder outputs toward DIFFERENT codebook entries
+            # This is the key fix: ASR alone can't break collapse because it doesn't
+            # know the codebook geometry. We need to explicitly spread outputs across entries.
+            diversity_loss = torch.tensor(0.0, device=DEVICE)
+            if codes is not None:
+                sem_flat = rearrange(sem_latent, "b d t -> (b t) d")
+                cb_emb = raw_model.quantizer.semantic_codebook.embedding.to(
+                    device=sem_flat.device, dtype=sem_flat.dtype).detach()
+                # Soft assignment: compute distance to ALL codebook entries
+                dists = torch.cdist(sem_flat, cb_emb, p=2)  # [BT, 8192]
+                soft_assign = F.softmax(-dists / 10.0, dim=-1)  # temperature-scaled
+                # Entropy of average assignment across batch (higher = more diverse)
+                avg_assign = soft_assign.mean(dim=0)  # [8192]
+                entropy = -(avg_assign * (avg_assign + 1e-10).log()).sum()
+                max_entropy = math.log(min(sem_flat.shape[0], cb_emb.shape[0]))
+                diversity_loss = (max_entropy - entropy) / max_entropy  # 0=perfect, 1=collapsed
 
             # Scale regularization
             sem_std = latent.float()[:, :256, :].std()
             scale_loss = (sem_std - 13.6).abs()
 
-            # Combined generator loss (matching paper eq. 3)
+            # Combined generator loss (boosted ASR + codebook diversity to break collapse)
+            ASR_WEIGHT = float(os.environ.get("ASR_WEIGHT", "5.0"))
+            DIV_WEIGHT = float(os.environ.get("DIV_WEIGHT", "2.0"))
             g_loss = (rec_weight * mel_loss
                       + rec_weight * wav_loss
                       + rec_weight * stft_loss
                       + 1.0 * feat_loss
                       + 0.1 * commit_loss
-                      + 1.0 * asr_loss
+                      + ASR_WEIGHT * asr_loss
+                      + DIV_WEIGHT * diversity_loss
                       + 0.3 * scale_loss)
 
             opt_g.zero_grad()
@@ -1129,14 +1221,18 @@ def train():
             if global_step >= DISC_START_STEP:
                 torch.cuda.empty_cache()
                 disc.train()
-                disc_real = disc(audio_f[..., :min_len].detach())
-                disc_fake = disc(recon_f[..., :min_len].detach())
+                audio_d = audio_f[..., :min_len].detach()
+                recon_d = recon_f[..., :min_len].detach()
+                disc_real = disc(audio_d)
+                disc_fake = disc(recon_d)
                 d_loss = discriminator_loss(disc_real, disc_fake)
                 opt_d.zero_grad()
                 d_loss.backward()
                 torch.nn.utils.clip_grad_norm_(disc.parameters(), 1.0)
                 opt_d.step()
                 d_loss_val = d_loss.item()
+                del disc_real, disc_fake, audio_d, recon_d, d_loss
+                torch.cuda.empty_cache()
 
             loss = g_loss  # for logging
             global_step += 1
@@ -1144,7 +1240,7 @@ def train():
             epoch_loss += loss.item()
             n_batches += 1
 
-            if (batch_idx + 1) % LOG_EVERY == 0:
+            if IS_MAIN and (batch_idx + 1) % LOG_EVERY == 0:
                 # Get code stats
                 sem_util = 0
                 aco_sample = []
@@ -1156,27 +1252,35 @@ def train():
                 print(f"  [E{epoch} B{batch_idx+1}/{len(loader)}] "
                       f"g={g_loss.item():.3f} mel={mel_loss.item():.3f} "
                       f"feat={feat_loss.item():.3f} d={d_loss_val:.3f} "
-                      f"asr={asr_loss.item():.3f} commit={commit_loss.item():.3f} "
+                      f"asr={asr_loss.item():.3f} div={diversity_loss.item():.3f} "
+                      f"commit={commit_loss.item():.3f} "
                       f"sem_util={sem_util}/8192 aco={aco_sample} "
                       f"rw={rec_weight:.3f} lr={sched_g.get_last_lr()[0]:.2e}", flush=True)
 
         avg_loss = epoch_loss / max(n_batches, 1)
-        print(f"\n  Epoch {epoch}/{EPOCHS}: avg_loss={avg_loss:.4f}", flush=True)
+        if IS_MAIN:
+            print(f"\n  Epoch {epoch}/{EPOCHS}: avg_loss={avg_loss:.4f}", flush=True)
 
-        # Save best
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            enc_state = {n: p.data.cpu() for n, p in model.named_parameters()
+        # Save best (rank 0 only)
+        if IS_MAIN:
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                enc_state = {n: p.data.cpu() for n, p in raw_model.named_parameters()
+                             if n.startswith("input_proj.") or n.startswith("encoder_blocks.")}
+                torch.save(enc_state, os.path.join(OUTPUT_DIR, "best_encoder.pt"))
+                print(f"  Saved best (loss={best_loss:.4f})", flush=True)
+
+            # Save every epoch
+            enc_state = {n: p.data.cpu() for n, p in raw_model.named_parameters()
                          if n.startswith("input_proj.") or n.startswith("encoder_blocks.")}
-            torch.save(enc_state, os.path.join(OUTPUT_DIR, "best_encoder.pt"))
-            print(f"  Saved best (loss={best_loss:.4f})", flush=True)
+            torch.save(enc_state, os.path.join(OUTPUT_DIR, f"encoder_ep{epoch}.pt"))
 
-        # Save every epoch
-        enc_state = {n: p.data.cpu() for n, p in model.named_parameters()
-                     if n.startswith("input_proj.") or n.startswith("encoder_blocks.")}
-        torch.save(enc_state, os.path.join(OUTPUT_DIR, f"encoder_ep{epoch}.pt"))
+        if WORLD_SIZE > 1:
+            dist.barrier()
 
-    print(f"\nTraining complete. Best loss: {best_loss:.4f}")
+    if IS_MAIN: print(f"\nTraining complete. Best loss: {best_loss:.4f}")
+    if WORLD_SIZE > 1:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

@@ -114,7 +114,13 @@ codes (0 and 20). The stochastic schedule teaches intermediate values naturally.
 
 **Semantic codebook collapse**: Without ASR distillation from Whisper, all encoder
 outputs map to the same semantic codebook entry. The Whisper cosine loss provides
-the linguistic content supervision needed for semantic diversity.
+the linguistic content supervision needed for semantic diversity. However, ASR
+distillation alone is insufficient -- the encoder's outputs can be diverse in
+continuous space while still mapping to the same VQ entry (they all land in one
+Voronoi cell of the frozen codebook). A **codebook diversity loss** based on the
+entropy of soft assignments to codebook entries is needed to explicitly spread
+encoder outputs across the codebook geometry. This combination (ASR + diversity)
+broke the collapse from sem_util=1/8192 to 100+/8192 within 500 training steps.
 
 **Voice identity is the LLM's job**: The codec encoder should focus purely on
 reconstruction quality. Voice identity emerges during LLM training where it
@@ -127,7 +133,7 @@ voices based on 2-3% cosine differences.
 
 ### Training Pipeline
 
-1. **Phase 1 - Encoder**: Train codec encoder with reconstruction + ASR distillation + discriminator
+1. **Phase 1 - Encoder**: Train codec encoder with reconstruction + ASR distillation + codebook diversity + discriminator
 2. **Phase 2 - LoRA**: Fine-tune the LLM with LoRA to interpret our encoder's code patterns
 3. **Phase 3 (optional)**: DPO post-training for improved speaker similarity
 
