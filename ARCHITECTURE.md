@@ -122,19 +122,48 @@ entropy of soft assignments to codebook entries is needed to explicitly spread
 encoder outputs across the codebook geometry. This combination (ASR + diversity)
 broke the collapse from sem_util=1/8192 to 100+/8192 within 500 training steps.
 
-**Voice identity is the LLM's job**: The codec encoder should focus purely on
-reconstruction quality. Voice identity emerges during LLM training where it
-processes (voice_reference, text) -> audio pairs. Attempts to add voice identity
-losses to the encoder training are counterproductive.
+**Voice identity requires explicit supervision**: Contrary to common assumption,
+mel reconstruction quality alone does NOT preserve speaker identity at low bitrates
+(2.14 kbps). Research on SAC (Semantic-Acoustic Codec) and Codec-ASV shows that
+codecs optimized for perceptual quality can discard speaker-discriminative features.
+A **frozen speaker verification loss** (ECAPA-TDNN or ERes2Net) provides the explicit
+"same person" signal that reconstruction losses cannot. SAC's ablation showed removing
+speaker loss drops speaker similarity from 0.78 to 0.65.
+
+**Sample rate mismatch kills identity**: Training on 16 kHz audio (LibriSpeech)
+upsampled to 24 kHz means the 8-12 kHz band contains interpolated artifacts.
+Speaker timbre, breathiness, and formant details live in this band. The encoder
+learns to ignore it, collapsing all speakers to a generic voice. Native 24 kHz
+data (LibriTTS-R) is essential.
+
+**EnCodec's gradient balancer**: Manual loss weight tuning (ASR_WEIGHT=5, DIV_WEIGHT=5)
+caused mel loss to plateau at 1.5 for 2+ epochs. EnCodec's gradient-norm balancer
+auto-scales each loss so that weights control the fraction of total gradient magnitude,
+not raw scale. This eliminates the need for manual tuning and prevents any single
+loss from dominating the gradient budget.
+
+**GAN training dynamics**: EnCodec uses Adam beta1=0.5 (not 0.8-0.9) and a lightweight
+discriminator (32 channels) updated 67% of batches. Heavy discriminators (256 channels)
+updated infrequently (12.5%) provide too sparse and too expensive a gradient signal.
 
 **Preset embedding structure**: Voice embeddings are sums of 37 codebook lookups.
 Preset-to-preset cosine similarity is very high (0.97-0.99). The LLM distinguishes
 voices based on 2-3% cosine differences.
 
-### Training Pipeline
+**LLM fine-tuning**: LoRA rank 8 destroys the base model. Rank 2 partially works
+but damages preset voices. The most promising approach is fine-tuning only the
+`audio_token_embedding` layer (28M params, 0.8% of model) to re-learn the mapping
+from our codec's code distributions to embedding space.
 
-1. **Phase 1 - Encoder**: Train codec encoder with reconstruction + ASR distillation + codebook diversity + discriminator
-2. **Phase 2 - LoRA**: Fine-tune the LLM with LoRA to interpret our encoder's code patterns
+### Training Pipeline (V3)
+
+1. **Phase 1 - Encoder**: Train codec encoder with:
+   - Reconstruction (mel + wav + STFT) via gradient balancer
+   - Frozen speaker verification loss (ECAPA-TDNN)
+   - ASR distillation + codebook diversity (reduced weight)
+   - Multi-resolution STFT discriminator (64 channels, 8 scales)
+   - Native 24 kHz data (LibriTTS-R)
+2. **Phase 2 - Embedding fine-tuning**: Fine-tune audio_token_embedding (28M params)
 3. **Phase 3 (optional)**: DPO post-training for improved speaker similarity
 
 ## Checkpoint Structure
