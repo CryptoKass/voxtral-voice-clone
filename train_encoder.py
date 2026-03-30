@@ -1,21 +1,13 @@
 """
-Voxtral Codec Encoder Training.
+Voxtral Codec Encoder Training (V3).
 
-Implements the codec encoder architecture described in the Voxtral TTS paper
-(https://mistral.ai/static/research/voxtral-tts.pdf). The encoder was not
-included in the open-weight release; this script trains it from scratch using
-the frozen decoder and quantizer weights from the checkpoint.
-
-Training follows the paper's recipe with key additions:
-  - Stochastic VQ (50% quantize / 25% dither / 25% passthrough)
-  - ASR distillation from Whisper for semantic token diversity
-  - Codebook diversity loss (entropy-based) to break semantic collapse
-  - Multi-resolution STFT discriminator with feature matching loss
-  - Exponentially decaying reconstruction loss
-  - Multi-GPU DDP support (torchrun)
-
-After training, encoder weights can be injected into the model checkpoint
-to enable ref_audio voice cloning.
+Implements the codec encoder for Voxtral-4B-TTS with research-driven improvements:
+  - Native 24kHz training data (LibriTTS-R) to preserve 8-12kHz speaker timbre
+  - Frozen speaker verification loss (ECAPA-TDNN) for explicit identity supervision
+  - EnCodec gradient-norm loss balancer for automatic loss scaling
+  - Lighter discriminator (64ch) with frequent updates (every 2 batches)
+  - GAN-standard Adam beta1=0.5 for stable adversarial dynamics
+  - Multi-GPU DDP with manual gradient sync (required by balancer)
 """
 
 import os
@@ -758,6 +750,123 @@ class PresetVoiceData:
 
 
 # ============================================================
+# Frozen Speaker Verification Loss (ECAPA-TDNN)
+# ============================================================
+
+class FrozenSpeakerLoss(nn.Module):
+    """Speaker identity loss using frozen ECAPA-TDNN from SpeechBrain.
+    Compares speaker embeddings of original vs reconstructed audio.
+    Gradients flow through the differentiable forward pass to the encoder."""
+
+    def __init__(self, codec_sr=24000, device="cuda"):
+        super().__init__()
+        try:
+            import torchaudio
+            from speechbrain.inference.speaker import SpeakerRecognition
+            self.spk_model = SpeakerRecognition.from_hparams(
+                source="speechbrain/spkrec-ecapa-voxceleb",
+                savedir="pretrained_models/spk_ecapa",
+                run_opts={"device": device},
+            )
+            self.spk_model.eval()
+            for p in self.spk_model.parameters():
+                p.requires_grad = False
+            self.resample = torchaudio.transforms.Resample(
+                orig_freq=codec_sr, new_freq=16000
+            ).to(device)
+            self.enabled = True
+            print(f"FrozenSpeakerLoss: loaded ECAPA-TDNN on {device}")
+        except Exception as e:
+            self.enabled = False
+            print(f"FrozenSpeakerLoss: disabled ({e})")
+
+    def forward(self, original, reconstructed):
+        if not self.enabled:
+            return original.new_zeros(())
+        orig = original.squeeze(1).float()
+        recon = reconstructed.squeeze(1).float()
+        min_len = min(orig.shape[-1], recon.shape[-1])
+        orig = orig[..., :min_len].clamp(-1, 1)
+        recon = recon[..., :min_len].clamp(-1, 1)
+        orig_16k = self.resample(orig)
+        recon_16k = self.resample(recon)
+        with torch.no_grad():
+            target_emb = self.spk_model.encode_batch(orig_16k).squeeze(1)
+        pred_emb = self.spk_model.encode_batch(recon_16k).squeeze(1)
+        sim = F.cosine_similarity(pred_emb, target_emb, dim=-1)
+        return (1.0 - sim).mean()
+
+
+class NoOpSpeakerLoss(nn.Module):
+    def forward(self, original, reconstructed):
+        return original.new_zeros(())
+
+
+# ============================================================
+# Gradient-Norm Loss Balancer (from EnCodec / AudioCraft)
+# ============================================================
+
+class GradBalancer:
+    """Auto-scales loss gradients so weights control gradient fraction, not magnitude.
+    Eliminates manual loss weight tuning."""
+
+    def __init__(self, weights, total_norm=1.0, ema_decay=0.999, epsilon=1e-12):
+        self.weights = weights
+        self.total_norm = total_norm
+        self.ema_decay = ema_decay
+        self.epsilon = epsilon
+        self._ema_total = {}
+        self._ema_fix = {}
+        self._metrics = {}
+
+    @property
+    def metrics(self):
+        return self._metrics
+
+    def backward(self, losses, input_tensor):
+        from torch import autograd
+        norms = {}
+        grads = {}
+        for name, loss in losses.items():
+            if name not in self.weights:
+                continue
+            grad, = autograd.grad(loss, [input_tensor], retain_graph=True)
+            dims = tuple(range(1, grad.dim()))
+            norms[name] = grad.norm(dim=dims, p=2).mean()
+            grads[name] = grad
+
+        # Bias-corrected EMA
+        for key, value in norms.items():
+            self._ema_total[key] = self._ema_total.get(key, 0.0) * self.ema_decay + float(value)
+            self._ema_fix[key] = self._ema_fix.get(key, 0.0) * self.ema_decay + 1.0
+        avg_norms = {k: self._ema_total[k] / self._ema_fix[k] for k in norms}
+
+        # DDP average
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            keys = list(avg_norms.keys())
+            vals = torch.tensor([avg_norms[k] for k in keys], device=input_tensor.device)
+            dist.all_reduce(vals, op=dist.ReduceOp.SUM)
+            vals /= dist.get_world_size()
+            avg_norms = dict(zip(keys, vals.tolist()))
+
+        total_w = sum(self.weights[k] for k in avg_norms)
+        desired = {k: self.weights[k] / total_w for k in avg_norms}
+
+        out_grad = torch.zeros_like(input_tensor)
+        eff_loss = torch.tensor(0.0, device=input_tensor.device)
+        for name, avg_norm in avg_norms.items():
+            scale = desired[name] * self.total_norm / (self.epsilon + avg_norm)
+            out_grad.add_(grads[name], alpha=scale)
+            eff_loss += scale * losses[name].detach()
+
+        self._metrics = {f'ratio_{k}': v / sum(avg_norms.values())
+                         for k, v in avg_norms.items()}
+
+        input_tensor.backward(out_grad)
+        return eff_loss
+
+
+# ============================================================
 # Dataset
 # ============================================================
 
@@ -1008,6 +1117,27 @@ def train():
     model = load_decoder_weights(model, MODEL_DIR)
     model = model.to(DEVICE)
 
+    # Resume encoder from checkpoint if available
+    RESUME_CKPT = os.environ.get("RESUME_CKPT", "")
+    if not RESUME_CKPT:
+        for candidate in [os.path.join(OUTPUT_DIR, "best_encoder.pt"),
+                          os.path.join(OUTPUT_DIR, "encoder_ep2.pt"),
+                          os.path.join(OUTPUT_DIR, "encoder_ep1.pt")]:
+            if os.path.exists(candidate):
+                RESUME_CKPT = candidate
+                break
+    if RESUME_CKPT and os.path.exists(RESUME_CKPT):
+        if IS_MAIN: print(f"\nResuming encoder from {RESUME_CKPT}...")
+        enc_state = torch.load(RESUME_CKPT, map_location="cpu", weights_only=True)
+        loaded_enc = 0
+        for name, param in model.named_parameters():
+            if name in enc_state:
+                param.data.copy_(enc_state[name].to(param.device))
+                loaded_enc += 1
+        if IS_MAIN: print(f"  Loaded {loaded_enc} encoder weights from checkpoint")
+    else:
+        if IS_MAIN: print("\nStarting encoder from scratch (no checkpoint found)")
+
     # Freeze decoder + quantizer, only train encoder
     encoder_params = []
     for name, param in model.named_parameters():
@@ -1041,18 +1171,18 @@ def train():
     # HuggingFace datasets (LibriSpeech)
     try:
         from datasets import load_dataset as hf_load
-        if IS_MAIN: print("  Loading LibriSpeech clean-360 from HuggingFace cache...")
-        hf_clean = hf_load('openslr/librispeech_asr', 'clean', split='train.360', cache_dir=HF_CACHE)
+        if IS_MAIN: print("  Loading LibriTTS-R (native 24kHz) from HuggingFace cache...")
+        hf_clean = hf_load('mythicinfinity/libritts_r', 'clean', split='train.clean.360', cache_dir=HF_CACHE)
         datasets_list.append(HFAudioDataset(hf_clean))
-        if IS_MAIN: print(f"  LibriSpeech clean-360: {len(hf_clean)} clips")
+        if IS_MAIN: print(f"  LibriTTS-R clean-360: {len(hf_clean)} clips")
 
         try:
-            if IS_MAIN: print("  Loading LibriSpeech other-500...")
-            hf_other = hf_load('openslr/librispeech_asr', 'other', split='train.500', cache_dir=HF_CACHE)
+            if IS_MAIN: print("  Loading LibriTTS-R other-500...")
+            hf_other = hf_load('mythicinfinity/libritts_r', 'other', split='train.other.500', cache_dir=HF_CACHE)
             datasets_list.append(HFAudioDataset(hf_other))
-            if IS_MAIN: print(f"  LibriSpeech other-500: {len(hf_other)} clips")
+            if IS_MAIN: print(f"  LibriTTS-R other-500: {len(hf_other)} clips")
         except Exception as e:
-            if IS_MAIN: print(f"  LibriSpeech other-500: not available ({e})")
+            if IS_MAIN: print(f"  LibriTTS-R other-500: not available ({e})")
     except Exception as e:
         if IS_MAIN: print(f"  HuggingFace datasets not available: {e}")
 
@@ -1097,26 +1227,41 @@ def train():
         except Exception as e:
             if IS_MAIN: print(f"ASR distillation: disabled ({e})")
 
+    # Speaker verification loss (frozen ECAPA-TDNN)
+    USE_SPK_LOSS = os.environ.get("USE_SPK_LOSS", "1") == "1"
+    spk_loss_fn = NoOpSpeakerLoss().to(DEVICE)
+    if USE_SPK_LOSS:
+        try:
+            spk_loss_fn = FrozenSpeakerLoss(codec_sr=SAMPLE_RATE, device=DEVICE)
+            if IS_MAIN: print(f"Speaker loss: enabled")
+        except Exception as e:
+            if IS_MAIN: print(f"Speaker loss: disabled ({e})")
+
     # Discriminator (paper: 8 multi-resolution STFT discriminators)
-    disc = MultiResolutionDiscriminator(channels=256, n_layers=4).to(DEVICE).float()
+    DISC_CHANNELS = int(os.environ.get("DISC_CHANNELS", "64"))
+    disc = MultiResolutionDiscriminator(channels=DISC_CHANNELS, n_layers=4).to(DEVICE).float()
     disc_params = sum(p.numel() for p in disc.parameters())
     if IS_MAIN: print(f"Discriminator: {disc_params:,} params")
     DISC_START_STEP = 2000  # warm-up: no adversarial loss for first N steps
 
-    # Wrap encoder model in DDP (disc stays local -- it has its own optimizer
-    # and doesn't need gradient sync since each GPU trains its own copy)
-    if WORLD_SIZE > 1:
-        model = DDP(model, device_ids=[LOCAL_RANK], find_unused_parameters=True)
-    raw_model = model.module if WORLD_SIZE > 1 else model
+    # No DDP wrapping -- the GradBalancer does manual backward + gradient sync.
+    # DDP hooks conflict with autograd.grad() calls in the balancer.
+    raw_model = model
 
     # Optimizers (separate for generator and discriminator, matching paper)
     all_trainable = encoder_params + asr_params
-    opt_g = torch.optim.AdamW(all_trainable, lr=LR, betas=(0.8, 0.99), weight_decay=1e-4)
-    opt_d = torch.optim.AdamW(disc.parameters(), lr=1e-4, betas=(0.8, 0.99), weight_decay=1e-4)
+    opt_g = torch.optim.AdamW(all_trainable, lr=LR, betas=(0.5, 0.9), weight_decay=1e-4)
+    opt_d = torch.optim.AdamW(disc.parameters(), lr=3e-4, betas=(0.5, 0.9), weight_decay=1e-4)
     total_steps = EPOCHS * len(loader)
     sched_g = torch.optim.lr_scheduler.CosineAnnealingLR(opt_g, T_max=total_steps)
 
-    # Paper-aligned training: stochastic VQ from epoch 1, no phasing
+    # Gradient-norm loss balancer (from EnCodec/AudioCraft)
+    balancer = GradBalancer(
+        weights={'mel': 4.0, 'wav': 1.0, 'stft': 1.0, 'feat': 2.0, 'spk': 3.0},
+        total_norm=1.0, ema_decay=0.999,
+    )
+    if IS_MAIN: print(f"GradBalancer: weights={balancer.weights}")
+
     global_step = 0
     best_loss = float('inf')
     for epoch in range(1, EPOCHS + 1):
@@ -1140,31 +1285,37 @@ def train():
             audio_f = audio.float()
             min_len = min(recon_f.shape[-1], audio_f.shape[-1])
 
-            # === GENERATOR LOSSES (paper-aligned) ===
+            # === GENERATOR LOSSES ===
+            recon_slice = recon_f[..., :min_len]
+            audio_slice = audio_f[..., :min_len]
 
-            # Reconstruction: mel + L1 + STFT (with decay factor from paper)
-            rec_weight = 0.9999 ** global_step  # exponential decay as discriminator strengthens
-            mel_loss = multi_resolution_mel_loss(recon_f[..., :min_len], audio_f[..., :min_len])
-            wav_loss = F.l1_loss(recon_f[..., :min_len], audio_f[..., :min_len])
-            stft_loss = stft_magnitude_loss(recon_f[..., :min_len].squeeze(1), audio_f[..., :min_len].squeeze(1))
+            mel_loss = multi_resolution_mel_loss(recon_slice, audio_slice)
+            wav_loss = F.l1_loss(recon_slice, audio_slice)
+            stft_loss = stft_magnitude_loss(recon_slice.squeeze(1), audio_slice.squeeze(1))
 
-            # Feature matching loss (primary signal from paper, replaces raw GAN loss)
+            # Feature matching (disc)
+            DISC_EVERY = int(os.environ.get("DISC_EVERY", "2"))
             feat_loss = torch.tensor(0.0, device=DEVICE)
-            if global_step >= DISC_START_STEP:
+            disc_this_step = (global_step >= DISC_START_STEP) and (global_step % DISC_EVERY == 0)
+            if disc_this_step:
                 torch.cuda.empty_cache()
-                recon_disc = recon_f[..., :min_len].detach().requires_grad_(True)
-                audio_disc = audio_f[..., :min_len].detach()
                 disc.eval()
                 with torch.no_grad():
-                    disc_real = disc(audio_disc)
+                    disc_real = disc(audio_slice.detach())
                     fmaps_real = [fmaps for _, fmaps in disc_real]
-                disc_fake = disc(recon_disc)
+                disc_fake = disc(recon_slice)
                 fmaps_fake = [fmaps for _, fmaps in disc_fake]
                 feat_loss = feature_matching_loss(fmaps_real, fmaps_fake)
-                del disc_real, disc_fake, fmaps_real, fmaps_fake, recon_disc, audio_disc
+                del disc_real, fmaps_real
                 torch.cuda.empty_cache()
 
-            # VQ commitment loss (delta=0.1 from paper)
+            # Speaker verification loss (every 4 batches to save memory)
+            SPK_EVERY = int(os.environ.get("SPK_EVERY", "4"))
+            spk_loss = torch.tensor(0.0, device=DEVICE)
+            if global_step % SPK_EVERY == 0:
+                spk_loss = spk_loss_fn(audio, recon)
+
+            # VQ commitment loss
             commit_loss = torch.tensor(0.0, device=DEVICE)
             if codes is not None:
                 with torch.no_grad():
@@ -1172,53 +1323,71 @@ def train():
                         raw_model.quantizer.encode(latent.float()), dtype=torch.float32)
                 commit_loss = F.mse_loss(latent.float(), quantized_hard.detach())
 
-            # ASR distillation (every batch -- strong signal needed to break sem collapse)
-            asr_loss = torch.tensor(0.0, device=DEVICE)
+            # ASR distillation
             sem_latent = latent.float()[:, :256, :]
             asr_loss = asr_loss_fn(audio, sem_latent)
 
-            # Codebook diversity loss: pull encoder outputs toward DIFFERENT codebook entries
-            # This is the key fix: ASR alone can't break collapse because it doesn't
-            # know the codebook geometry. We need to explicitly spread outputs across entries.
+            # Codebook diversity loss
             diversity_loss = torch.tensor(0.0, device=DEVICE)
             if codes is not None:
                 sem_flat = rearrange(sem_latent, "b d t -> (b t) d")
                 cb_emb = raw_model.quantizer.semantic_codebook.embedding.to(
                     device=sem_flat.device, dtype=sem_flat.dtype).detach()
-                # Soft assignment: compute distance to ALL codebook entries
-                dists = torch.cdist(sem_flat, cb_emb, p=2)  # [BT, 8192]
-                soft_assign = F.softmax(-dists / 10.0, dim=-1)  # temperature-scaled
-                # Entropy of average assignment across batch (higher = more diverse)
-                avg_assign = soft_assign.mean(dim=0)  # [8192]
+                dists = torch.cdist(sem_flat, cb_emb, p=2)
+                soft_assign = F.softmax(-dists / 10.0, dim=-1)
+                avg_assign = soft_assign.mean(dim=0)
                 entropy = -(avg_assign * (avg_assign + 1e-10).log()).sum()
                 max_entropy = math.log(min(sem_flat.shape[0], cb_emb.shape[0]))
-                diversity_loss = (max_entropy - entropy) / max_entropy  # 0=perfect, 1=collapsed
+                diversity_loss = (max_entropy - entropy) / max_entropy
+
+            # Acoustic distribution shaping (target std=0.55 for preset-aligned codes)
+            aco_latent = latent.float()[:, 256:, :]
+            aco_sat_loss = aco_latent.mean().abs() + (aco_latent.std() - 0.55).abs()
 
             # Scale regularization
             sem_std = latent.float()[:, :256, :].std()
             scale_loss = (sem_std - 13.6).abs()
 
-            # Combined generator loss (boosted ASR + codebook diversity to break collapse)
-            ASR_WEIGHT = float(os.environ.get("ASR_WEIGHT", "5.0"))
-            DIV_WEIGHT = float(os.environ.get("DIV_WEIGHT", "2.0"))
-            g_loss = (rec_weight * mel_loss
-                      + rec_weight * wav_loss
-                      + rec_weight * stft_loss
-                      + 1.0 * feat_loss
-                      + 0.1 * commit_loss
-                      + ASR_WEIGHT * asr_loss
-                      + DIV_WEIGHT * diversity_loss
-                      + 0.3 * scale_loss)
+            # === BALANCED BACKWARD (EnCodec-style) ===
+            # Balanced losses flow through recon (auto-scaled by gradient norm)
+            balanced_losses = {'mel': mel_loss, 'wav': wav_loss, 'stft': stft_loss}
+            if disc_this_step and feat_loss.requires_grad:
+                balanced_losses['feat'] = feat_loss
+            if spk_loss.requires_grad:
+                balanced_losses['spk'] = spk_loss
+
+            # Unbalanced losses flow through latent (manual weights, reduced)
+            ASR_WEIGHT = float(os.environ.get("ASR_WEIGHT", "1.0"))
+            DIV_WEIGHT = float(os.environ.get("DIV_WEIGHT", "1.0"))
+            other_loss = (0.1 * commit_loss
+                          + ASR_WEIGHT * asr_loss
+                          + DIV_WEIGHT * diversity_loss
+                          + 2.0 * aco_sat_loss
+                          + 0.3 * scale_loss)
 
             opt_g.zero_grad()
-            g_loss.backward()
+
+            # 1) Normal backward for latent-space losses
+            if other_loss.requires_grad:
+                other_loss.backward(retain_graph=True)
+
+            # 2) Balanced backward for reconstruction losses
+            g_loss = balancer.backward(balanced_losses, recon_slice)
+
+            # 3) Manual gradient sync for DDP (balancer bypasses DDP hooks)
+            if WORLD_SIZE > 1:
+                for p in all_trainable:
+                    if p.grad is not None:
+                        dist.all_reduce(p.grad.data, op=dist.ReduceOp.SUM)
+                        p.grad.data /= WORLD_SIZE
+
             torch.nn.utils.clip_grad_norm_(all_trainable, 1.0)
             opt_g.step()
             sched_g.step()
 
-            # === DISCRIMINATOR STEP (after warm-up) ===
+            # === DISCRIMINATOR STEP (same frequency as feature matching) ===
             d_loss_val = 0.0
-            if global_step >= DISC_START_STEP:
+            if disc_this_step:
                 torch.cuda.empty_cache()
                 disc.train()
                 audio_d = audio_f[..., :min_len].detach()
@@ -1234,10 +1403,9 @@ def train():
                 del disc_real, disc_fake, audio_d, recon_d, d_loss
                 torch.cuda.empty_cache()
 
-            loss = g_loss  # for logging
             global_step += 1
 
-            epoch_loss += loss.item()
+            epoch_loss += mel_loss.item()
             n_batches += 1
 
             if IS_MAIN and (batch_idx + 1) % LOG_EVERY == 0:
@@ -1250,12 +1418,12 @@ def train():
                     aco_sample = codes[0, 1:, fi].tolist()[:8]
 
                 print(f"  [E{epoch} B{batch_idx+1}/{len(loader)}] "
-                      f"g={g_loss.item():.3f} mel={mel_loss.item():.3f} "
+                      f"mel={mel_loss.item():.3f} "
                       f"feat={feat_loss.item():.3f} d={d_loss_val:.3f} "
+                      f"spk={spk_loss.item():.3f} "
                       f"asr={asr_loss.item():.3f} div={diversity_loss.item():.3f} "
-                      f"commit={commit_loss.item():.3f} "
                       f"sem_util={sem_util}/8192 aco={aco_sample} "
-                      f"rw={rec_weight:.3f} lr={sched_g.get_last_lr()[0]:.2e}", flush=True)
+                      f"lr={sched_g.get_last_lr()[0]:.2e}", flush=True)
 
         avg_loss = epoch_loss / max(n_batches, 1)
         if IS_MAIN:
