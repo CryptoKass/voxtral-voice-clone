@@ -40,8 +40,12 @@ LOG_EVERY = 25
 try:
     from google.colab import userdata
     os.environ["HF_TOKEN"] = userdata.get("HF_TOKEN")
-except ImportError:
+except:
     print("Not in Google Colab")
+    if os.environ.get("HF_TOKEN"):
+        print("!!! HF_TOKEN is set")
+    else:
+        print("!!! HF_TOKEN is not set")
     pass
 
 def setup_distributed():
