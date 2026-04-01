@@ -37,6 +37,13 @@ EPOCHS = 30
 SAMPLE_RATE = 24000
 LOG_EVERY = 25
 
+try:
+    from google.colab import userdata
+    os.environ["HF_TOKEN"] = userdata.get("HF_TOKEN")
+except ImportError:
+    print("Not in Google Colab")
+    pass
+
 def setup_distributed():
     if "RANK" in os.environ:
         dist.init_process_group("nccl")
