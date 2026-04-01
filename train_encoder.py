@@ -1172,17 +1172,9 @@ def train():
     try:
         from datasets import load_dataset as hf_load
         if IS_MAIN: print("  Loading LibriTTS-R (native 24kHz) from HuggingFace cache...")
-        hf_clean = hf_load('mythicinfinity/libritts_r', 'clean', split='train.clean.360', cache_dir=HF_CACHE)
+        hf_clean = hf_load('mythicinfinity/libritts_r', 'clean', split='train.clean.100', cache_dir=HF_CACHE)
         datasets_list.append(HFAudioDataset(hf_clean))
-        if IS_MAIN: print(f"  LibriTTS-R clean-360: {len(hf_clean)} clips")
-
-        try:
-            if IS_MAIN: print("  Loading LibriTTS-R other-500...")
-            hf_other = hf_load('mythicinfinity/libritts_r', 'other', split='train.other.500', cache_dir=HF_CACHE)
-            datasets_list.append(HFAudioDataset(hf_other))
-            if IS_MAIN: print(f"  LibriTTS-R other-500: {len(hf_other)} clips")
-        except Exception as e:
-            if IS_MAIN: print(f"  LibriTTS-R other-500: not available ({e})")
+        if IS_MAIN: print(f"  LibriTTS-R clean-100: {len(hf_clean)} clips")
     except Exception as e:
         if IS_MAIN: print(f"  HuggingFace datasets not available: {e}")
 
