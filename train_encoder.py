@@ -837,7 +837,9 @@ class GradBalancer:
         for name, loss in losses.items():
             if name not in self.weights:
                 continue
-            grad, = autograd.grad(loss, [input_tensor], retain_graph=True)
+            grad, = autograd.grad(loss, [input_tensor], retain_graph=True, allow_unused=True)
+            if grad is None:
+                continue
             dims = tuple(range(1, grad.dim()))
             norms[name] = grad.norm(dim=dims, p=2).mean()
             grads[name] = grad
