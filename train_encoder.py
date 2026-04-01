@@ -44,7 +44,7 @@ except:
     print("Not in Google Colab")
     if os.environ.get("HF_TOKEN"):
         # print the token but all characters are replaced with *
-        print("!!! HF_TOKEN is set: " + "*" * len(os.environ.get("HF_TOKEN")) etc)
+        print("!!! HF_TOKEN is set: " + "*" * len(os.environ.get("HF_TOKEN")))
     else:
         print("!!! HF_TOKEN is not set")
     pass
