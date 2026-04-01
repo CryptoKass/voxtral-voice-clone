@@ -13,6 +13,7 @@ Implements the codec encoder for Voxtral-4B-TTS with research-driven improvement
 import os
 import sys
 import math
+import warnings
 import glob
 import json
 import torch
@@ -651,10 +652,13 @@ class ASRDistillationLoss(nn.Module):
             # Create attention mask for encoder features (all ones since we padded with feature_extractor)
             encoder_attention_mask = torch.ones(input_features.shape[0], input_features.shape[-1],
                                                 device=input_features.device, dtype=torch.long)
-            generated = self.whisper.generate(
-                input_features=input_features,
-                attention_mask=encoder_attention_mask,
-                max_new_tokens=self.max_tokens)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=".*max_new_tokens.*max_length.*")
+                warnings.filterwarnings("ignore", message=".*custom logits processor.*")
+                generated = self.whisper.generate(
+                    input_features=input_features,
+                    attention_mask=encoder_attention_mask,
+                    max_new_tokens=self.max_tokens)
             if generated.shape[1] < 2:
                 bos = self.whisper.config.decoder_start_token_id
                 generated = torch.tensor([[bos, bos]], device=audio.device).repeat(input_features.shape[0], 1)
